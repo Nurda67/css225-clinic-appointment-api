@@ -2,9 +2,11 @@ from datetime import date
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Path, Query, Response, status
+from sqlalchemy.orm import Session
 
-from app.dependencies import get_store, require_roles
-from app.domain import Appointment, AppointmentStatus, MedicalRecord, Role, Schedule, User
+from app.dependencies import get_session, require_roles
+from app.domain import AppointmentStatus, Role
+from app.models import Appointment, MedicalRecord, Schedule, User
 from app.schemas.errors import error_responses
 from app.schemas.visits import (
     AppointmentInput,
@@ -19,11 +21,10 @@ from app.schemas.visits import (
     SlotResponse,
 )
 from app.services import visits
-from app.store import Store
 
 
 router = APIRouter()
-StoreDependency = Annotated[Store, Depends(get_store)]
+DatabaseSession = Annotated[Session, Depends(get_session)]
 Patient = Annotated[User, Depends(require_roles(Role.PATIENT))]
 Doctor = Annotated[User, Depends(require_roles(Role.DOCTOR))]
 PatientOrDoctor = Annotated[User, Depends(require_roles(Role.PATIENT, Role.DOCTOR))]
@@ -38,12 +39,12 @@ ResourceId = Annotated[int, Path(gt=0)]
 def list_slots(
     doctor_id: ResourceId,
     day: Annotated[date, Query(alias="date", description="Date in the clinic calendar.")],
-    store: StoreDependency,
+    session: DatabaseSession,
 ) -> list[SlotResponse]:
     """List the doctor's future, unreserved slots on a date."""
     return [
         SlotResponse(starts_at=start, ends_at=end)
-        for start, end in visits.available_slots(store, doctor_id, day)
+        for start, end in visits.available_slots(session, doctor_id, day)
     ]
 
 
@@ -52,9 +53,9 @@ def list_slots(
     tags=["Doctor schedule"],
     responses=error_responses(401, 403),
 )
-def get_own_schedule(doctor: Doctor, store: StoreDependency) -> DoctorSchedule:
+def get_own_schedule(doctor: Doctor, session: DatabaseSession) -> DoctorSchedule:
     """View your weekly working hours and days off."""
-    schedule, days_off = visits.doctor_schedule(store, doctor.id)
+    schedule, days_off = visits.doctor_schedule(session, doctor.id)
     return DoctorSchedule(
         schedule=[
             ScheduleItem(
@@ -75,11 +76,11 @@ def put_working_hours(
     weekday: Annotated[int, Path(ge=0, le=6, description="Monday is 0 and Sunday is 6.")],
     data: ScheduleInput,
     doctor: Doctor,
-    store: StoreDependency,
+    session: DatabaseSession,
 ) -> ScheduleItem:
     """Set your clinic-local working hours for a weekday."""
-    schedule = Schedule(data.start, data.end, data.slot_minutes)
-    visits.set_working_hours(store, doctor.id, weekday, schedule)
+    schedule = Schedule(start=data.start, end=data.end, slot_minutes=data.slot_minutes)
+    visits.set_working_hours(session, doctor.id, weekday, schedule)
     return ScheduleItem(weekday=weekday, **data.model_dump())
 
 
@@ -89,9 +90,9 @@ def put_working_hours(
     tags=["Doctor schedule"],
     responses=error_responses(401, 403, 409),
 )
-def post_day_off(data: DayOffInput, doctor: Doctor, store: StoreDependency) -> DayOffInput:
+def post_day_off(data: DayOffInput, doctor: Doctor, session: DatabaseSession) -> DayOffInput:
     """Mark a date as closed if you have no upcoming visits that day."""
-    visits.add_day_off(store, doctor.id, data.date)
+    visits.add_day_off(session, doctor.id, data.date)
     return data
 
 
@@ -101,9 +102,9 @@ def post_day_off(data: DayOffInput, doctor: Doctor, store: StoreDependency) -> D
     tags=["Doctor schedule"],
     responses=error_responses(401, 403, 404),
 )
-def delete_day_off(day: date, doctor: Doctor, store: StoreDependency) -> Response:
+def delete_day_off(day: date, doctor: Doctor, session: DatabaseSession) -> Response:
     """Remove a date override and restore the weekly schedule for that day."""
-    visits.remove_day_off(store, doctor.id, day)
+    visits.remove_day_off(session, doctor.id, day)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -115,10 +116,10 @@ def delete_day_off(day: date, doctor: Doctor, store: StoreDependency) -> Respons
     responses=error_responses(401, 403, 404, 409),
 )
 def post_appointment(
-    data: AppointmentInput, patient: Patient, store: StoreDependency
+    data: AppointmentInput, patient: Patient, session: DatabaseSession
 ) -> Appointment:
     """Book an available slot for the authenticated patient."""
-    return visits.book_appointment(store, patient.id, data.doctor_id, data.starts_at)
+    return visits.book_appointment(session, patient.id, data.doctor_id, data.starts_at)
 
 
 @router.get(
@@ -129,11 +130,11 @@ def post_appointment(
 )
 def get_appointments(
     user: PatientOrDoctor,
-    store: StoreDependency,
+    session: DatabaseSession,
     status: AppointmentStatus | None = None,
 ) -> list[Appointment]:
     """List your own appointments, optionally filtered by status."""
-    return visits.list_appointments(store, user, status)
+    return visits.list_appointments(session, user, status)
 
 
 @router.patch(
@@ -146,10 +147,10 @@ def patch_appointment(
     appointment_id: ResourceId,
     data: AppointmentUpdate,
     patient: Patient,
-    store: StoreDependency,
+    session: DatabaseSession,
 ) -> Appointment:
     """Cancel one of your own future bookings."""
-    return visits.cancel_appointment(store, patient.id, appointment_id)
+    return visits.cancel_appointment(session, patient.id, appointment_id)
 
 
 @router.post(
@@ -163,10 +164,10 @@ def post_medical_record(
     appointment_id: ResourceId,
     data: MedicalRecordInput,
     doctor: Doctor,
-    store: StoreDependency,
+    session: DatabaseSession,
 ) -> MedicalRecord:
     """Save the result of an assigned visit and mark it done."""
-    return visits.create_medical_record(store, doctor.id, appointment_id, data.diagnosis, data.notes)
+    return visits.create_medical_record(session, doctor.id, appointment_id, data.diagnosis, data.notes)
 
 
 @router.get(
@@ -176,7 +177,7 @@ def post_medical_record(
     responses=error_responses(401, 403, 404),
 )
 def get_medical_history(
-    patient_id: ResourceId, user: PatientOrDoctor, store: StoreDependency
+    patient_id: ResourceId, user: PatientOrDoctor, session: DatabaseSession
 ) -> list[MedicalRecord]:
     """View your records as a patient, or the records you authored as a doctor."""
-    return visits.medical_history(store, user, patient_id)
+    return visits.medical_history(session, user, patient_id)

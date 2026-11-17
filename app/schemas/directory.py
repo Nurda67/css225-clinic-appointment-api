@@ -3,7 +3,7 @@ from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StringConstraints
 
-Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=2, max_length=120)]
+Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=2, max_length=120, pattern=r"^[^\x00]*$")]
 
 
 class SpecialtyWrite(BaseModel):

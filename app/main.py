@@ -1,25 +1,27 @@
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import OperationalError
 from starlette.exceptions import HTTPException
 
+from app.config import get_database_url
+from app.database import Database
 from app.errors import DomainError
 from app.routers import directory, visits
 from app.schemas.errors import ErrorResponse
-from app.store import Store
 
 
-def create_app(store: Store | None = None) -> FastAPI:
+def create_app(database: Database | None = None) -> FastAPI:
     application = FastAPI(
         title="Clinic Appointment API",
-        version="1.0.0",
+        version="2.0.0",
         description=(
             "Find doctors, book appointments, and manage clinic schedules. "
             "Use the Authorize button with a demo token from the README."
         ),
         responses={422: {"model": ErrorResponse, "description": "Invalid request"}},
     )
-    application.state.store = store if store is not None else Store(seed_demo_visit=True)
+    application.state.database = database if database is not None else Database(get_database_url())
 
     @application.exception_handler(DomainError)
     async def handle_domain_error(_: Request, exc: DomainError) -> JSONResponse:
@@ -58,6 +60,16 @@ def create_app(store: Store | None = None) -> FastAPI:
             status_code=exc.status_code,
             content={"error": {"code": code, "message": str(exc.detail)}},
             headers=exc.headers,
+        )
+
+    @application.exception_handler(OperationalError)
+    async def handle_database_error(_: Request, exc: OperationalError) -> JSONResponse:
+        return JSONResponse(
+            status_code=503,
+            content={"error": {
+                "code": "database_unavailable",
+                "message": "The database is temporarily unavailable.",
+            }},
         )
 
     @application.get("/", tags=["Service"])

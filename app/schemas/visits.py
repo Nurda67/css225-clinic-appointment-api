@@ -6,15 +6,24 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    field_serializer,
     field_validator,
     model_validator,
 )
 
 from app.domain import AppointmentStatus
+from app.database import CLINIC_TZ
 
 
 class VisitRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    @field_validator("*")
+    @classmethod
+    def reject_null_characters(cls, value: object) -> object:
+        if isinstance(value, str) and "\x00" in value:
+            raise ValueError("Text cannot contain a null character.")
+        return value
 
 
 class ScheduleInput(VisitRequest):
@@ -63,6 +72,10 @@ class SlotResponse(BaseModel):
     starts_at: datetime
     ends_at: datetime
 
+    @field_serializer("starts_at", "ends_at")
+    def serialize_clinic_time(self, value: datetime) -> str:
+        return value.astimezone(CLINIC_TZ).isoformat()
+
 
 class AppointmentInput(VisitRequest):
     doctor_id: Annotated[int, Field(strict=True, gt=0)] = Field(examples=[3])
@@ -107,3 +120,7 @@ class MedicalRecordResponse(BaseModel):
     diagnosis: str
     notes: str
     created_at: datetime
+
+    @field_serializer("created_at")
+    def serialize_clinic_time(self, value: datetime) -> str:
+        return value.astimezone(CLINIC_TZ).isoformat()

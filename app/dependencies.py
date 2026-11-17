@@ -1,12 +1,16 @@
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from hashlib import sha256
 from typing import Annotated
 
 from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
-from app.domain import Role, User
+from app.domain import Role
 from app.errors import DomainError
-from app.store import Store
+from app.models import AccessToken, User
 
 bearer = HTTPBearer(
     scheme_name="DemoBearer",
@@ -15,20 +19,33 @@ bearer = HTTPBearer(
 )
 
 
-def get_store(request: Request) -> Store:
-    return request.app.state.store
+def get_session(request: Request) -> Iterator[Session]:
+    with request.app.state.database.session_factory() as session:
+        try:
+            with session.begin():
+                yield session
+        except IntegrityError as error:
+            constraint = getattr(getattr(error.orig, "diag", None), "constraint_name", None)
+            if constraint == "uq_appointments_active_slot":
+                raise DomainError(409, "slot_taken", "This slot has already been booked.") from error
+            if constraint == "uq_specialties_name_lower":
+                raise DomainError(409, "specialty_name_taken", "A specialty with that name already exists.") from error
+            raise DomainError(
+                409, "data_conflict", "This operation conflicts with existing or related data."
+            ) from error
 
 
 def require_roles(*roles: Role) -> Callable[..., User]:
     def check_access(
-        store: Annotated[Store, Depends(get_store)],
+        session: Annotated[Session, Depends(get_session)],
         credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
     ) -> User:
         if credentials is None:
             raise DomainError(401, "authentication_required", "Provide a bearer token.")
-        with store.lock:
-            user_id = store.tokens.get(credentials.credentials)
-            user = store.users.get(user_id) if user_id is not None else None
+        token_hash = sha256(credentials.credentials.encode()).hexdigest()
+        user = session.scalar(
+            select(User).join(AccessToken).where(AccessToken.token_hash == token_hash)
+        )
         if user is None:
             raise DomainError(401, "invalid_token", "The bearer token is invalid.")
         if user.role not in roles:
