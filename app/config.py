@@ -3,6 +3,13 @@ import os
 from sqlalchemy import URL, make_url
 
 
+def get_jwt_secret() -> str:
+    secret = os.getenv("JWT_SECRET", "")
+    if len(secret.encode("utf-8")) < 32:
+        raise ValueError("Set JWT_SECRET to a random key of at least 32 bytes.")
+    return secret
+
+
 def get_database_url() -> URL:
     configured_url = os.getenv("DATABASE_URL")
     if configured_url:

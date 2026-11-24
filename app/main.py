@@ -1,83 +1,65 @@
-from fastapi import FastAPI, Request
+from pathlib import Path
+
+from fastapi import FastAPI
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from starlette.exceptions import HTTPException
 
-from app.config import get_database_url
+from app.config import get_database_url, get_jwt_secret
 from app.database import Database
-from app.errors import DomainError
-from app.routers import directory, visits
-from app.schemas.errors import ErrorResponse
+from app.errors import (
+    DomainError,
+    ErrorResponse,
+    handle_database_error,
+    handle_domain_error,
+    handle_http_error,
+    handle_integrity_error,
+    handle_validation_error,
+)
+from app.routers import auth, booking_workflows, directory, encounters, outcomes, schedule, visits
 
 
 def create_app(database: Database | None = None) -> FastAPI:
     application = FastAPI(
         title="Clinic Appointment API",
-        version="2.0.0",
+        version="4.0.0",
         description=(
             "Find doctors, book appointments, and manage clinic schedules. "
-            "Use the Authorize button with a demo token from the README."
+            "Open /clinic for the clinic desk or /docs for the API."
         ),
         responses={422: {"model": ErrorResponse, "description": "Invalid request"}},
     )
-    application.state.database = database if database is not None else Database(get_database_url())
+    if database is None:
+        database = Database(get_database_url())
+    application.state.database = database
+    application.state.jwt_secret = get_jwt_secret()
 
-    @application.exception_handler(DomainError)
-    async def handle_domain_error(_: Request, exc: DomainError) -> JSONResponse:
-        headers = {"WWW-Authenticate": "Bearer"} if exc.status_code == 401 else None
-        return JSONResponse(
-            status_code=exc.status_code,
-            content={"error": {"code": exc.code, "message": exc.message}},
-            headers=headers,
-        )
-
-    @application.exception_handler(RequestValidationError)
-    async def handle_validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
-        details = [
-            {
-                "field": ".".join(map(str, issue["loc"])),
-                "message": issue["msg"],
-                "type": issue["type"],
-            }
-            for issue in exc.errors()
-        ]
-        return JSONResponse(
-            status_code=422,
-            content={
-                "error": {
-                    "code": "validation_error",
-                    "message": "One or more request fields are invalid.",
-                    "details": details,
-                }
-            },
-        )
-
-    @application.exception_handler(HTTPException)
-    async def handle_http_error(_: Request, exc: HTTPException) -> JSONResponse:
-        code = {404: "not_found", 405: "method_not_allowed"}.get(exc.status_code, "http_error")
-        return JSONResponse(
-            status_code=exc.status_code,
-            content={"error": {"code": code, "message": str(exc.detail)}},
-            headers=exc.headers,
-        )
-
-    @application.exception_handler(OperationalError)
-    async def handle_database_error(_: Request, exc: OperationalError) -> JSONResponse:
-        return JSONResponse(
-            status_code=503,
-            content={"error": {
-                "code": "database_unavailable",
-                "message": "The database is temporarily unavailable.",
-            }},
-        )
+    application.add_exception_handler(DomainError, handle_domain_error)
+    application.add_exception_handler(RequestValidationError, handle_validation_error)
+    application.add_exception_handler(HTTPException, handle_http_error)
+    application.add_exception_handler(IntegrityError, handle_integrity_error)
+    application.add_exception_handler(OperationalError, handle_database_error)
 
     @application.get("/", tags=["Service"])
     def root() -> dict[str, str]:
         return {"service": "Clinic Appointment API", "docs": "/docs"}
 
+    web_dir = Path(__file__).resolve().parent / "web"
+    application.mount("/clinic-assets", StaticFiles(directory=web_dir), name="clinic-assets")
+
+    @application.get("/clinic", include_in_schema=False)
+    def clinic() -> FileResponse:
+        return FileResponse(web_dir / "index.html")
+
+    application.include_router(auth.router)
+    application.include_router(schedule.router)
     application.include_router(visits.router)
     application.include_router(directory.router)
+    application.include_router(booking_workflows.router)
+    application.include_router(encounters.router)
+    application.include_router(outcomes.router)
     return application
 
 

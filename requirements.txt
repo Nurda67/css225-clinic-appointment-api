@@ -5,3 +5,7 @@ SQLAlchemy==2.0.45
 alembic==1.20.1
 psycopg[binary]==3.3.9
 python-dotenv==1.2.4
+PyJWT==2.15.1
+pwdlib[argon2]==0.3.0
+email-validator==2.3.0
+reportlab==4.4.10

@@ -1,17 +1,21 @@
 from datetime import datetime, time, timedelta
-from hashlib import sha256
+from os import getenv
 
 from sqlalchemy import func, select, text
+from sqlalchemy.exc import ArgumentError, IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
+from app.activate_user import prompt_for_password
 from app.config import get_database_url
 from app.database import CLINIC_TZ, Database, now
 from app.domain import Role
-from app.models import AccessToken, Appointment, Doctor, Schedule, Specialty, User
+from app.errors import DomainError
+from app.models import Appointment, Doctor, Schedule, Specialty, User
+from app.services.accounts import set_user_credentials
 
 
-def seed_demo_data(session: Session, *, include_visit: bool = True) -> None:
-    """Insert fictional demo accounts once, preserving subsequent application data."""
+def seed_demo_data(session: Session, *, demo_password: str, include_visit: bool = True) -> None:
+    """Set up fictional demo accounts and preserve existing credentials and clinic data."""
     session.execute(text("SELECT pg_advisory_xact_lock(225006)"))
     for specialty_id, name in [(1, "General Practice"), (2, "Cardiology")]:
         existing = session.get(Specialty, specialty_id)
@@ -20,25 +24,21 @@ def seed_demo_data(session: Session, *, include_visit: bool = True) -> None:
     session.flush()
 
     demo_users = [
-        (1, "Dana Omar", Role.PATIENT, "demo-patient"),
-        (2, "Arman Iskakov", Role.PATIENT, "demo-patient-2"),
-        (3, "Aida Sadykova", Role.DOCTOR, "demo-doctor"),
-        (4, "Timur Saparov", Role.DOCTOR, "demo-doctor-2"),
-        (5, "Clinic Admin", Role.ADMIN, "demo-admin"),
+        (1, "Dana Omar", Role.PATIENT, "patient@example.com"),
+        (2, "Arman Iskakov", Role.PATIENT, "patient2@example.com"),
+        (3, "Aida Sadykova", Role.DOCTOR, "doctor@example.com"),
+        (4, "Timur Saparov", Role.DOCTOR, "doctor2@example.com"),
+        (5, "Clinic Admin", Role.ADMIN, "admin@example.com"),
     ]
-    for user_id, name, role, token in demo_users:
-        user = session.get(User, user_id)
+    for user_id, name, role, email in demo_users:
+        user = session.get(User, user_id, with_for_update=True, populate_existing=True)
         if user is None:
-            session.add(User(id=user_id, name=name, role=role))
+            user = User(id=user_id, name=name, role=role)
+            session.add(user)
         elif user.name != name or user.role != role:
             raise ValueError("Demo account IDs are occupied by different users.")
-        session.flush()
-        token_hash = sha256(token.encode()).hexdigest()
-        saved_token = session.get(AccessToken, token_hash)
-        if saved_token is None:
-            session.add(AccessToken(token_hash=token_hash, user_id=user_id))
-        elif saved_token.user_id != user_id:
-            raise ValueError("A demo token belongs to a different user.")
+        if user.email is None:
+            set_user_credentials(session, user, email, demo_password)
 
     for doctor_id, specialty_id in [(3, 1), (4, 2)]:
         if session.get(Doctor, doctor_id) is None:
@@ -74,11 +74,24 @@ def seed_demo_data(session: Session, *, include_visit: bool = True) -> None:
 
 
 def main() -> None:
-    database = Database(get_database_url())
+    demo_password = getenv("DEMO_PASSWORD") or prompt_for_password()
+    if not 8 <= len(demo_password) <= 128:
+        raise SystemExit("Set DEMO_PASSWORD to a password with 8 to 128 characters.")
+
+    try:
+        database = Database(get_database_url())
+    except (ArgumentError, ValueError):
+        raise SystemExit("Check the clinic database settings.") from None
     try:
         with database.session_factory.begin() as session:
-            seed_demo_data(session)
+            seed_demo_data(session, demo_password=demo_password)
         print("Fictional demo accounts are ready. Existing data was preserved.")
+    except (DomainError, ValueError) as error:
+        raise SystemExit(str(error)) from None
+    except IntegrityError:
+        raise SystemExit("Demo credentials conflict with existing data.") from None
+    except OperationalError:
+        raise SystemExit("Could not connect to the clinic database.") from None
     finally:
         database.dispose()
 

@@ -1,55 +1,58 @@
 from collections.abc import Callable, Iterator
-from hashlib import sha256
 from typing import Annotated
 
-from fastapi import Depends, Request
+from fastapi import Depends, Path, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.domain import Role
 from app.errors import DomainError
-from app.models import AccessToken, User
+from app.models import User
+from app.security import get_token_user_id
 
 bearer = HTTPBearer(
-    scheme_name="DemoBearer",
-    description="Enter a demo token from the README.",
+    scheme_name="JWTBearer",
+    bearerFormat="JWT",
+    description="Enter the access token returned by POST /auth/login.",
     auto_error=False,
 )
 
 
 def get_session(request: Request) -> Iterator[Session]:
-    with request.app.state.database.session_factory() as session:
-        try:
-            with session.begin():
-                yield session
-        except IntegrityError as error:
-            constraint = getattr(getattr(error.orig, "diag", None), "constraint_name", None)
-            if constraint == "uq_appointments_active_slot":
-                raise DomainError(409, "slot_taken", "This slot has already been booked.") from error
-            if constraint == "uq_specialties_name_lower":
-                raise DomainError(409, "specialty_name_taken", "A specialty with that name already exists.") from error
-            raise DomainError(
-                409, "data_conflict", "This operation conflicts with existing or related data."
-            ) from error
+    # Each request shares one session. Success commits and an error rolls back.
+    with request.app.state.database.session_factory.begin() as session:
+        yield session
 
 
-def require_roles(*roles: Role) -> Callable[..., User]:
-    def check_access(
-        session: Annotated[Session, Depends(get_session)],
-        credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
-    ) -> User:
-        if credentials is None:
-            raise DomainError(401, "authentication_required", "Provide a bearer token.")
-        token_hash = sha256(credentials.credentials.encode()).hexdigest()
-        user = session.scalar(
-            select(User).join(AccessToken).where(AccessToken.token_hash == token_hash)
-        )
-        if user is None:
-            raise DomainError(401, "invalid_token", "The bearer token is invalid.")
+DatabaseSession = Annotated[Session, Depends(get_session)]
+ResourceId = Annotated[int, Path(gt=0)]
+
+
+def get_current_user(
+    request: Request,
+    session: DatabaseSession,
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
+) -> User:
+    if credentials is None:
+        raise DomainError(401, "authentication_required", "Provide a bearer token.")
+
+    user_id = get_token_user_id(credentials.credentials, request.app.state.jwt_secret)
+    user = session.get(User, user_id)
+    if user is None or user.email is None:
+        raise DomainError(401, "invalid_token", "The bearer token is invalid or expired.")
+    return user
+
+
+def require_roles(*roles: Role) -> Callable[[User], User]:
+    def check_role(user: Annotated[User, Depends(get_current_user)]) -> User:
         if user.role not in roles:
             raise DomainError(403, "forbidden", "Your role cannot perform this operation.")
         return user
 
-    return check_access
+    return check_role
+
+
+Patient = Annotated[User, Depends(require_roles(Role.PATIENT))]
+DoctorUser = Annotated[User, Depends(require_roles(Role.DOCTOR))]
+PatientOrDoctor = Annotated[User, Depends(require_roles(Role.PATIENT, Role.DOCTOR))]
+AdminUser = Annotated[User, Depends(require_roles(Role.ADMIN))]

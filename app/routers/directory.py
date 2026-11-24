@@ -1,35 +1,27 @@
 from datetime import date
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Path, Query, Response, status
+from fastapi import APIRouter, Query, Response, status
 
-from sqlalchemy.orm import Session
-
-from app.dependencies import get_session, require_roles
-from app.domain import Role
-from app.models import User
-from app.schemas.directory import (
+from app.dependencies import AdminUser, DatabaseSession, ResourceId
+from app.errors import error_responses
+from app.models import Specialty
+from app.schemas import (
     DoctorCreate,
-    DoctorCreated,
     DoctorUpdate,
     DoctorView,
     SpecialtyView,
     SpecialtyWrite,
     StatisticsView,
 )
-from app.schemas.errors import error_responses
 from app.services import directory
 
 
 router = APIRouter()
 
-SessionDependency = Annotated[Session, Depends(get_session)]
-AdminUser = Annotated[User, Depends(require_roles(Role.ADMIN))]
-PositivePathID = Annotated[int, Path(gt=0)]
-
 
 @router.get("/specialties", tags=["Directory"], response_model=list[SpecialtyView])
-def list_specialties(session: SessionDependency):
+def list_specialties(session: DatabaseSession) -> list[Specialty]:
     """List the specialties available in the clinic directory."""
     return directory.list_specialties(session)
 
@@ -41,7 +33,7 @@ def list_specialties(session: SessionDependency):
     status_code=status.HTTP_201_CREATED,
     responses=error_responses(401, 403, 409),
 )
-def create_specialty(body: SpecialtyWrite, session: SessionDependency, _admin: AdminUser):
+def create_specialty(body: SpecialtyWrite, session: DatabaseSession, _admin: AdminUser) -> Specialty:
     """Add a specialty with a unique name."""
     return directory.create_specialty(session, body.name)
 
@@ -53,8 +45,8 @@ def create_specialty(body: SpecialtyWrite, session: SessionDependency, _admin: A
     responses=error_responses(401, 403, 404, 409),
 )
 def rename_specialty(
-    specialty_id: PositivePathID, body: SpecialtyWrite, session: SessionDependency, _admin: AdminUser
-):
+    specialty_id: ResourceId, body: SpecialtyWrite, session: DatabaseSession, _admin: AdminUser
+) -> Specialty:
     """Rename a specialty and keep its existing doctor assignments."""
     return directory.rename_specialty(session, specialty_id, body.name)
 
@@ -65,7 +57,9 @@ def rename_specialty(
     status_code=status.HTTP_204_NO_CONTENT,
     responses=error_responses(401, 403, 404, 409),
 )
-def delete_specialty(specialty_id: PositivePathID, session: SessionDependency, _admin: AdminUser):
+def delete_specialty(
+    specialty_id: ResourceId, session: DatabaseSession, _admin: AdminUser
+) -> Response:
     """Delete a specialty if it has no assigned doctors."""
     directory.delete_specialty(session, specialty_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -78,10 +72,12 @@ def delete_specialty(specialty_id: PositivePathID, session: SessionDependency, _
     responses=error_responses(404),
 )
 def list_doctors(
-    session: SessionDependency,
+    session: DatabaseSession,
     specialty_id: Annotated[int | None, Query(gt=0)] = None,
-    q: Annotated[str | None, Query(max_length=120, pattern=r"^[^\x00]*[^\s\x00][^\x00]*$")] = None,
-):
+    q: Annotated[
+        str | None, Query(max_length=120, pattern=r"^[^\x00]*[^\s\x00][^\x00]*$")
+    ] = None,
+) -> list[dict[str, object]]:
     """Find active doctors by name, specialty name, or specialty ID."""
     return directory.list_doctors(session, specialty_id, q)
 
@@ -92,21 +88,25 @@ def list_doctors(
     response_model=DoctorView,
     responses=error_responses(404),
 )
-def get_doctor(doctor_id: PositivePathID, session: SessionDependency):
+def get_doctor(doctor_id: ResourceId, session: DatabaseSession) -> dict[str, object]:
     """View an active doctor's public profile."""
-    return directory.get_public_doctor(session, doctor_id)
+    return directory.get_doctor(session, doctor_id)
 
 
 @router.post(
     "/doctors",
     tags=["Administration"],
-    response_model=DoctorCreated,
+    response_model=DoctorView,
     status_code=status.HTTP_201_CREATED,
-    responses=error_responses(401, 403, 404),
+    responses=error_responses(401, 403, 404, 409),
 )
-def create_doctor(body: DoctorCreate, session: SessionDependency, _admin: AdminUser):
-    """Create a doctor account and issue its bearer token."""
-    return directory.create_doctor(session, body.name, body.specialty_id)
+def create_doctor(
+    body: DoctorCreate, session: DatabaseSession, _admin: AdminUser
+) -> dict[str, object]:
+    """Create a doctor account with credentials for /auth/login."""
+    return directory.create_doctor(
+        session, body.name, body.specialty_id, body.email, body.password.get_secret_value()
+    )
 
 
 @router.patch(
@@ -116,10 +116,10 @@ def create_doctor(body: DoctorCreate, session: SessionDependency, _admin: AdminU
     responses=error_responses(401, 403, 404),
 )
 def update_doctor_status(
-    doctor_id: PositivePathID, body: DoctorUpdate, session: SessionDependency, _admin: AdminUser
-):
+    doctor_id: ResourceId, body: DoctorUpdate, session: DatabaseSession, _admin: AdminUser
+) -> dict[str, object]:
     """Block or unblock new bookings while preserving existing appointments."""
-    return directory.set_doctor_status(session, doctor_id, body.is_active)
+    return directory.update_doctor_status(session, doctor_id, body.is_active)
 
 
 @router.get(
@@ -129,10 +129,10 @@ def update_doctor_status(
     responses=error_responses(401, 403),
 )
 def get_statistics(
-    session: SessionDependency,
+    session: DatabaseSession,
     _admin: AdminUser,
     start_date: Annotated[date | None, Query(description="First clinic date (inclusive).")] = None,
     end_date: Annotated[date | None, Query(description="Last clinic date (inclusive).")] = None,
-):
+) -> dict[str, object]:
     """Show directory totals and appointment counts for the selected clinic dates."""
     return directory.get_statistics(session, start_date, end_date)

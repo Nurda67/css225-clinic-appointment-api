@@ -11,3 +11,4 @@ class AppointmentStatus(StrEnum):
     BOOKED = "booked"
     CANCELLED = "cancelled"
     DONE = "done"
+    NO_SHOW = "no_show"

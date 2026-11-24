@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Clinic Desk</title>
+    <link rel="stylesheet" href="/clinic-assets/styles.css">
+    <script type="module" src="/clinic-assets/app.js"></script>
+</head>
+<body>
+    <a class="skip-link" href="#screen">Skip to content</a>
+    <header class="topbar">
+        <div class="topbar-inner">
+            <a class="brand" href="/clinic">
+                <span class="brand-mark" aria-hidden="true">+</span>
+                <span>Clinic Desk</span>
+            </a>
+            <div id="account-actions" class="account-actions"></div>
+        </div>
+    </header>
+    <div class="workspace">
+        <aside class="sidebar">
+            <nav id="navigation" aria-label="Clinic workspace"></nav>
+            <a class="api-link" href="/docs">API Documentation</a>
+        </aside>
+        <main id="screen" tabindex="-1" aria-labelledby="page-title"></main>
+    </div>
+    <div id="status" class="toast" role="status" aria-live="polite" hidden></div>
+    <dialog id="action-dialog" aria-labelledby="dialog-title">
+        <div class="dialog-header">
+            <h2 id="dialog-title"></h2>
+            <button type="button" id="close-dialog" class="icon-button" aria-label="Close dialog">×</button>
+        </div>
+        <div id="dialog-content" class="dialog-content"></div>
+        <p id="dialog-error" class="feedback error" role="alert" hidden></p>
+    </dialog>
+    <noscript>Enable JavaScript to use the clinic workspace.</noscript>
+</body>
+</html>

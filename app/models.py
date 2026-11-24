@@ -11,6 +11,7 @@ from sqlalchemy import (
     Integer,
     String,
     Time,
+    UniqueConstraint,
     func,
     text,
 )
@@ -22,10 +23,18 @@ from app.domain import AppointmentStatus, Role
 
 class User(Base):
     __tablename__ = "users"
-    __table_args__ = (CheckConstraint("length(trim(name)) >= 2", name="ck_users_name"),)
+    __table_args__ = (
+        CheckConstraint("length(trim(name)) >= 2", name="ck_users_name"),
+        CheckConstraint(
+            "(email IS NULL) = (password_hash IS NULL)", name="ck_users_credentials_pair"
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(120))
+    # Users created before Assignment 7 can activate their existing account.
+    email: Mapped[str | None] = mapped_column(String(320))
+    password_hash: Mapped[str | None] = mapped_column(String(255))
     role: Mapped[Role] = mapped_column(
         Enum(
             Role,
@@ -41,6 +50,14 @@ class User(Base):
         foreign_keys="Appointment.patient_id",
     )
     tokens: Mapped[list["AccessToken"]] = relationship(back_populates="user")
+
+
+Index(
+    "uq_users_email_lower",
+    func.lower(User.email),
+    unique=True,
+    postgresql_where=User.email.is_not(None),
+)
 
 
 class Specialty(Base):
@@ -79,6 +96,8 @@ class Doctor(Base):
 
 
 class AccessToken(Base):
+    """Assignment 6 token records retained for migration rollback."""
+
     __tablename__ = "access_tokens"
 
     token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -121,6 +140,9 @@ class DayOff(Base):
         primary_key=True,
     )
     date: Mapped[date] = mapped_column(Date, primary_key=True)
+    closed_for_replacement: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false")
+    )
     doctor: Mapped[Doctor] = relationship(back_populates="days_off")
 
 
@@ -128,6 +150,7 @@ class Appointment(Base):
     __tablename__ = "appointments"
     __table_args__ = (
         CheckConstraint("ends_at > starts_at", name="ck_appointments_window"),
+        UniqueConstraint("previous_appointment_id", name="uq_appointments_previous"),
         Index(
             "uq_appointments_active_slot",
             "doctor_id",
@@ -144,6 +167,10 @@ class Appointment(Base):
     patient_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
     starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    arrived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    previous_appointment_id: Mapped[int | None] = mapped_column(
+        ForeignKey("appointments.id", name="fk_appointments_previous", ondelete="RESTRICT")
+    )
     status: Mapped[AppointmentStatus] = mapped_column(
         Enum(
             AppointmentStatus,

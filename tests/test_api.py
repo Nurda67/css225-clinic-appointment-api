@@ -1,10 +1,13 @@
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from hashlib import sha256
+from json import dumps
 from threading import Barrier
 import unittest
 from pathlib import Path
 from uuid import uuid4
 
+import jwt
 from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
@@ -16,7 +19,16 @@ from app.database import CLINIC_TZ, Database
 from app.domain import AppointmentStatus, Role
 from app.main import create_app
 from app.models import AccessToken, Appointment, Doctor, Schedule, Specialty, User
+from app.security import create_access_token, hash_password
 from app.seed import seed_demo_data
+
+
+PATIENT_ID = 1
+SECOND_PATIENT_ID = 2
+DOCTOR_ID = 3
+SECOND_DOCTOR_ID = 4
+ADMIN_ID = 5
+DEMO_PASSWORD = "only-for-clinic-tests"
 
 
 class ClinicApiTests(unittest.TestCase):
@@ -32,7 +44,7 @@ class ClinicApiTests(unittest.TestCase):
         self.addCleanup(self.database.dispose)
         self.migrate("head")
         with self.database.session_factory.begin() as session:
-            seed_demo_data(session, include_visit=False)
+            seed_demo_data(session, demo_password=DEMO_PASSWORD, include_visit=False)
         self.app = create_app(database=self.database)
         self.client = TestClient(self.app)
         self.addCleanup(self.client.close)
@@ -55,8 +67,17 @@ class ClinicApiTests(unittest.TestCase):
             operation(config, revision)
 
     @staticmethod
-    def auth(token):
+    def bearer(token):
         return {"Authorization": f"Bearer {token}"}
+
+    def auth(self, user_id):
+        return self.bearer(create_access_token(user_id, self.app.state.jwt_secret))
+
+    def login(self, email, password=DEMO_PASSWORD):
+        response = self.client.post("/auth/login", json={"email": email, "password": password})
+        credentials = self.expect(response, 200)
+        self.assertEqual(credentials["token_type"], "bearer")
+        return credentials["access_token"]
 
     def expect(self, response, status):
         self.assertEqual(response.status_code, status, response.text)
@@ -69,7 +90,7 @@ class ClinicApiTests(unittest.TestCase):
             return None
         return response.json()
 
-    def book(self, doctor_id=3, hour=9, minute=0, patient="demo-patient", day=16):
+    def book(self, doctor_id=3, hour=9, minute=0, patient=PATIENT_ID, day=16):
         starts_at = datetime(2026, 11, day, hour, minute, tzinfo=CLINIC_TZ)
         return self.client.post(
             "/appointments",
@@ -86,11 +107,161 @@ class ClinicApiTests(unittest.TestCase):
         self.assertEqual(docs.status_code, 200)
         self.assertIn("SwaggerUIBundle", docs.text)
         schema = self.expect(self.client.get("/openapi.json"), 200)
+        self.assertIn("post", schema["paths"]["/auth/register"])
+        self.assertIn("post", schema["paths"]["/auth/login"])
+        self.assertTrue(schema["paths"]["/appointments"]["get"]["security"])
         self.assertTrue(
             any(
-                scheme["type"] == "http" and scheme["scheme"] == "bearer"
+                scheme["type"] == "http"
+                and scheme["scheme"] == "bearer"
+                and scheme.get("bearerFormat") == "JWT"
                 for scheme in schema["components"]["securitySchemes"].values()
             )
+        )
+
+    def test_registration_creates_a_patient_and_stores_only_a_salted_hash(self):
+        payload = {
+            "name": "New Patient",
+            "email": "New.Patient@Example.com",
+            "password": DEMO_PASSWORD,
+        }
+        created = self.expect(self.client.post("/auth/register", json=payload), 201)
+        self.assertEqual(set(created), {"id", "name", "email", "role"})
+        self.assertEqual(created["name"], payload["name"])
+        self.assertEqual(created["email"], "new.patient@example.com")
+        self.assertEqual(created["role"], "patient")
+
+        with self.database.session_factory() as session:
+            user = session.get(User, created["id"])
+            demo_patient = session.get(User, PATIENT_ID)
+            self.assertEqual(user.email, created["email"])
+            self.assertTrue(user.password_hash.startswith("$argon2id$"))
+            self.assertNotEqual(user.password_hash, payload["password"])
+            self.assertNotEqual(user.password_hash, demo_patient.password_hash)
+            self.assertEqual(session.scalar(select(func.count()).select_from(AccessToken)), 0)
+
+        token = self.login(payload["email"].upper())
+        visits = self.expect(self.client.get("/appointments", headers=self.bearer(token)), 200)
+        self.assertEqual(visits, [])
+
+    def test_registration_rejects_invalid_input_and_duplicate_email(self):
+        valid = {"name": "New Patient", "email": "new@example.com", "password": DEMO_PASSWORD}
+        cases = {
+            "missing password": {"name": valid["name"], "email": valid["email"]},
+            "short password": {**valid, "password": "short"},
+            "invalid email": {**valid, "email": "invalid-email"},
+            "privileged role": {**valid, "role": "admin"},
+        }
+        for case, payload in cases.items():
+            with self.subTest(case=case):
+                self.expect(self.client.post("/auth/register", json=payload), 422)
+
+        duplicate = {**valid, "email": "PATIENT@EXAMPLE.COM"}
+        error = self.expect(self.client.post("/auth/register", json=duplicate), 409)["error"]
+        self.assertEqual(error["code"], "email_taken")
+
+    def test_auth_rejects_invalid_unicode_input(self):
+        payload = {"email": "patient@example.com", "password": "invalid-unicode-\ud800"}
+        invalid_json_password = dumps(payload)
+        self.expect(self.client.post(
+            "/auth/login", content=invalid_json_password, headers={"Content-Type": "application/json"}
+        ), 422)
+        self.expect(self.client.post(
+            "/auth/register",
+            content=dumps({**payload, "email": "unicode@example.com", "name": "Test Patient"}),
+            headers={"Content-Type": "application/json"},
+        ), 422)
+
+        # Lowercasing the email expands each dotted capital I into two code points.
+        domain = ".".join(["a" * 63, "b" * 63, "c" * 63, "com"])
+        long_email = "\u0130" * 20 + "@" + domain
+        self.expect(self.client.post("/auth/register", json={
+            "name": "Test Patient", "email": long_email, "password": DEMO_PASSWORD,
+        }), 422)
+
+    def test_concurrent_registration_creates_only_one_account(self):
+        barrier = Barrier(2, timeout=10)
+
+        def register(email):
+            with TestClient(self.app) as client:
+                barrier.wait()
+                return client.post("/auth/register", json={
+                    "name": "Test Patient", "email": email, "password": DEMO_PASSWORD,
+                })
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            responses = list(pool.map(register, ("Same@example.com", "same@example.com")))
+        self.assertEqual(sorted(response.status_code for response in responses), [201, 409])
+        conflict = next(response for response in responses if response.status_code == 409)
+        self.assertEqual(conflict.json()["error"]["code"], "email_taken")
+
+    def test_login_rejects_wrong_password_and_unknown_email_consistently(self):
+        wrong_password = self.client.post(
+            "/auth/login", json={"email": "patient@example.com", "password": "wrong-password"}
+        )
+        unknown_email = self.client.post(
+            "/auth/login", json={"email": "unknown@example.com", "password": DEMO_PASSWORD}
+        )
+        self.assertEqual(self.expect(wrong_password, 401), self.expect(unknown_email, 401))
+        self.assertEqual(wrong_password.headers["WWW-Authenticate"], "Bearer")
+
+    def test_protected_route_rejects_missing_invalid_and_expired_tokens(self):
+        response = self.client.get("/appointments")
+        self.expect(response, 401)
+        self.assertEqual(response.headers["WWW-Authenticate"], "Bearer")
+
+        now = datetime.now(timezone.utc)
+        secret = self.app.state.jwt_secret
+        claims = {
+            "sub": str(PATIENT_ID),
+            "iss": "clinic-appointment-api",
+            "iat": now - timedelta(minutes=2),
+            "exp": now + timedelta(minutes=2),
+        }
+        invalid_tokens = {
+            "malformed": "not-a-jwt",
+            "wrong signature": jwt.encode(claims, uuid4().hex, algorithm="HS256"),
+            "expired": jwt.encode(
+                {**claims, "exp": now - timedelta(minutes=1)}, secret, algorithm="HS256"
+            ),
+            "missing expiration": jwt.encode(
+                {"sub": claims["sub"], "iss": claims["iss"], "iat": claims["iat"]},
+                secret,
+                algorithm="HS256",
+            ),
+            "unknown user": create_access_token(99999, secret),
+        }
+        for case, token in invalid_tokens.items():
+            with self.subTest(case=case):
+                response = self.client.get("/appointments", headers=self.bearer(token))
+                self.expect(response, 401)
+                self.assertEqual(response.headers["WWW-Authenticate"], "Bearer")
+
+        self.expect(
+            self.client.get("/appointments", headers=self.bearer(self.login("patient@example.com"))),
+            200,
+        )
+
+    def test_logged_in_users_respect_role_and_appointment_ownership(self):
+        patient = self.bearer(self.login("patient@example.com"))
+        second_patient = self.bearer(self.login("patient2@example.com"))
+        doctor = self.bearer(self.login("doctor@example.com"))
+        admin = self.bearer(self.login("admin@example.com"))
+        payload = {"doctor_id": DOCTOR_ID, "starts_at": "2026-11-16T09:00:00+05:00"}
+        visit = self.expect(self.client.post("/appointments", headers=patient, json=payload), 201)
+        cancel_path = f"/appointments/{visit['id']}"
+
+        self.assertEqual(self.expect(self.client.get("/appointments", headers=second_patient), 200), [])
+        self.expect(
+            self.client.patch(cancel_path, headers=second_patient, json={"status": "cancelled"}),
+            403,
+        )
+        self.expect(self.client.get("/doctors/me/schedule", headers=patient), 403)
+        self.expect(self.client.get("/doctors/me/schedule", headers=doctor), 200)
+        self.expect(self.client.post("/specialties", headers=doctor, json={"name": "Dermatology"}), 403)
+        self.expect(self.client.post("/specialties", headers=admin, json={"name": "Dermatology"}), 201)
+        self.expect(
+            self.client.patch(cancel_path, headers=patient, json={"status": "cancelled"}), 200
         )
 
     def test_public_directory_filters(self):
@@ -109,15 +280,15 @@ class ClinicApiTests(unittest.TestCase):
         self.expect(self.client.get("/doctors/999"), 404)
 
     def test_specialty_lifecycle_validation_and_authorization(self):
-        admin = self.auth("demo-admin")
+        admin = self.auth(ADMIN_ID)
         payload = {"name": "Dermatology"}
         self.expect(self.client.post("/specialties", json=payload), 401)
         self.expect(
-            self.client.post("/specialties", headers=self.auth("wrong-token"), json=payload),
+            self.client.post("/specialties", headers=self.bearer("wrong-token"), json=payload),
             401,
         )
         self.expect(
-            self.client.post("/specialties", headers=self.auth("demo-patient"), json=payload),
+            self.client.post("/specialties", headers=self.auth(PATIENT_ID), json=payload),
             403,
         )
         self.expect(self.client.post("/specialties", headers=admin, json={"name": " "}), 422)
@@ -136,17 +307,23 @@ class ClinicApiTests(unittest.TestCase):
         self.expect(self.client.delete(url, headers=admin), 404)
 
     def test_doctor_creation_and_blocking(self):
-        admin = self.auth("demo-admin")
-        payload = {"name": "Dr. Morgan", "specialty_id": 999}
+        admin = self.auth(ADMIN_ID)
+        payload = {
+            "name": "Dr. Morgan",
+            "specialty_id": 999,
+            "email": "morgan@example.com",
+            "password": DEMO_PASSWORD,
+        }
         self.expect(self.client.post("/doctors", headers=admin, json=payload), 404)
         payload["specialty_id"] = 1
         doctor = self.expect(self.client.post("/doctors", headers=admin, json=payload), 201)
-        self.assertTrue(doctor["access_token"])
-        doctor_id = doctor["id"]
-        public_doctor = self.expect(self.client.get(f"/doctors/{doctor_id}"), 200)
-        self.assertNotIn("access_token", public_doctor)
+        for private_field in ("email", "password", "password_hash", "access_token"):
+            self.assertNotIn(private_field, doctor)
+        public_doctor = self.expect(self.client.get(f"/doctors/{doctor['id']}"), 200)
+        self.assertEqual(public_doctor, doctor)
+        token = self.login(payload["email"], payload["password"])
         schedule = self.expect(
-            self.client.get("/doctors/me/schedule", headers=self.auth(doctor["access_token"])),
+            self.client.get("/doctors/me/schedule", headers=self.bearer(token)),
             200,
         )
         self.assertEqual(schedule["schedule"], [])
@@ -159,7 +336,7 @@ class ClinicApiTests(unittest.TestCase):
         self.expect(self.slots(), 404)
         self.expect(self.book(minute=30), 409)
         appointments = self.expect(
-            self.client.get("/appointments", headers=self.auth("demo-doctor")), 200
+            self.client.get("/appointments", headers=self.auth(DOCTOR_ID)), 200
         )
         self.assertIn(appointment["id"], {item["id"] for item in appointments})
         self.expect(
@@ -168,7 +345,7 @@ class ClinicApiTests(unittest.TestCase):
         self.expect(self.book(minute=30), 201)
 
     def test_recurring_slots_and_day_off(self):
-        doctor = self.auth("demo-doctor")
+        doctor = self.auth(DOCTOR_ID)
         response = self.expect(self.slots(), 200)
         self.assertEqual(len(response), 16)
         self.assertEqual(datetime.fromisoformat(response[0]["starts_at"]).hour, 9)
@@ -203,7 +380,7 @@ class ClinicApiTests(unittest.TestCase):
         self.assertEqual(len(self.expect(self.slots(), 200)), 3)
 
     def test_schedule_changes_preserve_existing_reservations(self):
-        doctor = self.auth("demo-doctor")
+        doctor = self.auth(DOCTOR_ID)
         self.expect(self.book(), 201)
         self.expect(
             self.client.put(
@@ -222,10 +399,10 @@ class ClinicApiTests(unittest.TestCase):
         self.assertEqual(datetime.fromisoformat(slots[0]["starts_at"]).minute, 30)
 
     def test_booking_conflicts_validation_and_ownership(self):
-        patient = self.auth("demo-patient")
-        second_patient = self.auth("demo-patient-2")
+        patient = self.auth(PATIENT_ID)
+        second_patient = self.auth(SECOND_PATIENT_ID)
         appointment = self.expect(self.book(), 201)
-        self.expect(self.book(patient="demo-patient-2"), 409)
+        self.expect(self.book(patient=SECOND_PATIENT_ID), 409)
         self.expect(self.book(doctor_id=4), 409)
         self.expect(self.book(minute=15), 409)
         self.expect(self.book(hour=7), 409)
@@ -259,7 +436,7 @@ class ClinicApiTests(unittest.TestCase):
             "cancelled",
         )
         self.expect(self.client.patch(path, headers=patient, json=cancel), 409)
-        rebooked = self.expect(self.book(patient="demo-patient-2"), 201)
+        rebooked = self.expect(self.book(patient=SECOND_PATIENT_ID), 201)
         self.assertNotEqual(rebooked["id"], appointment["id"])
         appointments = self.expect(
             self.client.get("/appointments", headers=patient, params={"status": "cancelled"}),
@@ -271,23 +448,23 @@ class ClinicApiTests(unittest.TestCase):
     def test_same_slot_concurrent_booking_has_one_winner(self):
         barrier = Barrier(2, timeout=5)
 
-        def attempt(token):
+        def attempt(patient_id):
             with TestClient(self.app) as client:
                 barrier.wait()
                 return client.post(
                     "/appointments",
-                    headers=self.auth(token),
+                    headers=self.auth(patient_id),
                     json={"doctor_id": 3, "starts_at": "2026-11-16T09:00:00+05:00"},
                 ).status_code
 
         with ThreadPoolExecutor(max_workers=2) as pool:
-            statuses = list(pool.map(attempt, ("demo-patient", "demo-patient-2")))
+            statuses = list(pool.map(attempt, (PATIENT_ID, SECOND_PATIENT_ID)))
         self.assertEqual(sorted(statuses), [201, 409])
 
     def test_consultation_and_patient_history(self):
-        patient = self.auth("demo-patient")
-        doctor = self.auth("demo-doctor")
-        second_doctor = self.auth("demo-doctor-2")
+        patient = self.auth(PATIENT_ID)
+        doctor = self.auth(DOCTOR_ID)
+        second_doctor = self.auth(SECOND_DOCTOR_ID)
         first = self.expect(self.book(), 201)
         path = f"/appointments/{first['id']}/medical-record"
         payload = {"diagnosis": "Fictional observation A", "notes": "Follow up in two weeks."}
@@ -297,8 +474,8 @@ class ClinicApiTests(unittest.TestCase):
 
         history = "/patients/1/medical-records"
         self.expect(self.client.get(history, headers=second_doctor), 403)
-        self.expect(self.client.get(history, headers=self.auth("demo-patient-2")), 403)
-        self.expect(self.client.get(history, headers=self.auth("demo-admin")), 403)
+        self.expect(self.client.get(history, headers=self.auth(SECOND_PATIENT_ID)), 403)
+        self.expect(self.client.get(history, headers=self.auth(ADMIN_ID)), 403)
         self.assertEqual(self.expect(self.client.get(history, headers=doctor), 200), [])
 
         second = self.expect(self.book(doctor_id=4, minute=30), 201)
@@ -339,7 +516,7 @@ class ClinicApiTests(unittest.TestCase):
         reopened = Database(get_database_url(), clock=lambda: self.now, schema=self.schema)
         try:
             with TestClient(create_app(database=reopened)) as client:
-                response = client.get("/appointments", headers=self.auth("demo-patient"))
+                response = client.get("/appointments", headers=self.auth(PATIENT_ID))
                 visits = self.expect(response, 200)
                 self.assertEqual([visit["id"] for visit in visits], [appointment["id"]])
         finally:
@@ -354,7 +531,7 @@ class ClinicApiTests(unittest.TestCase):
                 with TestClient(create_app(database=independent)) as client:
                     barrier.wait()
                     return client.post(
-                        "/appointments", headers=self.auth("demo-patient"),
+                        "/appointments", headers=self.auth(PATIENT_ID),
                         json={"doctor_id": doctor_id, "starts_at": "2026-11-16T09:00:00+05:00"},
                     ).status_code
             finally:
@@ -370,6 +547,13 @@ class ClinicApiTests(unittest.TestCase):
         bad_values = [
             Specialty(name="cardiology"),
             User(name=" ", role=Role.PATIENT),
+            User(name="Partial Credentials", role=Role.PATIENT, email="partial@example.com"),
+            User(
+                name="Duplicate Email",
+                role=Role.PATIENT,
+                email="PATIENT@EXAMPLE.COM",
+                password_hash=hash_password(DEMO_PASSWORD),
+            ),
             Doctor(id=99999, specialty_id=1),
             Appointment(doctor_id=3, patient_id=2, starts_at=start, ends_at=start + timedelta(minutes=30)),
             Appointment(doctor_id=4, patient_id=2, starts_at=start, ends_at=start),
@@ -406,11 +590,11 @@ class ClinicApiTests(unittest.TestCase):
                     barrier.wait()
                     if operation == "schedule":
                         return client.put(
-                            "/doctors/me/schedule/0", headers=self.auth("demo-doctor"),
+                            "/doctors/me/schedule/0", headers=self.auth(DOCTOR_ID),
                             json={"start": "10:00", "end": "17:00", "slot_minutes": 30},
                         ).status_code
                     return client.post(
-                        "/appointments", headers=self.auth("demo-patient"),
+                        "/appointments", headers=self.auth(PATIENT_ID),
                         json={"doctor_id": 3, "starts_at": "2026-11-16T09:00:00+05:00"},
                     ).status_code
             finally:
@@ -424,42 +608,54 @@ class ClinicApiTests(unittest.TestCase):
             count = session.scalar(select(func.count()).select_from(Appointment))
             self.assertEqual((schedule.start.hour, count), (10, 0) if statuses[0] == 200 else (9, 1))
 
-    def test_failed_transaction_leaves_no_partial_user_or_token(self):
+    def test_failed_transaction_leaves_no_partial_doctor_account(self):
+        payload = {
+            "name": "Rollback Doctor",
+            "specialty_id": 99999,
+            "email": "rollback@example.com",
+            "password": DEMO_PASSWORD,
+        }
         with self.database.session_factory() as session:
             user_count = session.scalar(select(func.count()).select_from(User))
-            token_count = session.scalar(select(func.count()).select_from(AccessToken))
+            doctor_count = session.scalar(select(func.count()).select_from(Doctor))
         self.expect(
-            self.client.post("/doctors", headers=self.auth("demo-admin"),
-                             json={"name": "Rollback Doctor", "specialty_id": 99999}),
+            self.client.post("/doctors", headers=self.auth(ADMIN_ID), json=payload),
             404,
         )
         with self.database.session_factory() as session:
             self.assertEqual(session.scalar(select(func.count()).select_from(User)), user_count)
-            self.assertEqual(session.scalar(select(func.count()).select_from(AccessToken)), token_count)
+            self.assertEqual(session.scalar(select(func.count()).select_from(Doctor)), doctor_count)
         with self.assertRaises(IntegrityError):
             with self.database.session_factory.begin() as session:
-                user = User(name="Rollback Doctor", role=Role.DOCTOR)
+                user = User(
+                    name=payload["name"],
+                    role=Role.DOCTOR,
+                    email=payload["email"],
+                    password_hash=hash_password(DEMO_PASSWORD),
+                )
                 session.add(user)
                 session.flush()
-                session.add(AccessToken(token_hash="f" * 64, user_id=user.id))
-                session.add(Doctor(id=user.id, specialty_id=99999))
+                session.add(Doctor(id=user.id, specialty_id=payload["specialty_id"]))
                 session.flush()
         with self.database.session_factory() as session:
             self.assertEqual(session.scalar(select(func.count()).select_from(User)), user_count)
-            self.assertEqual(session.scalar(select(func.count()).select_from(AccessToken)), token_count)
+            self.assertEqual(session.scalar(select(func.count()).select_from(Doctor)), doctor_count)
 
     def test_seed_is_idempotent_and_preserves_edits(self):
         self.expect(self.book(), 201)
-        self.expect(self.client.patch("/doctors/3", headers=self.auth("demo-admin"),
+        self.expect(self.client.patch("/doctors/3", headers=self.auth(ADMIN_ID),
                                      json={"is_active": False}), 200)
         with self.database.session_factory.begin() as session:
+            saved_hash = session.get(User, PATIENT_ID).password_hash
             schedule = session.get(Schedule, (4, 0))
             session.delete(schedule)
-            seed_demo_data(session, include_visit=False)
-            seed_demo_data(session, include_visit=False)
+            seed_demo_data(session, demo_password=DEMO_PASSWORD, include_visit=False)
+            seed_demo_data(session, demo_password="different-test-password", include_visit=False)
         with self.database.session_factory() as session:
             self.assertEqual(session.scalar(select(func.count()).select_from(User)), 5)
-            self.assertEqual(session.scalar(select(func.count()).select_from(AccessToken)), 5)
+            self.assertEqual(session.scalar(select(func.count(User.password_hash))), 5)
+            self.assertEqual(session.get(User, PATIENT_ID).password_hash, saved_hash)
+            self.assertEqual(session.scalar(select(func.count()).select_from(AccessToken)), 0)
             self.assertEqual(session.scalar(select(func.count()).select_from(Appointment)), 1)
             self.assertFalse(session.get(Doctor, 3).is_active)
             self.assertIsNone(session.get(Schedule, (4, 0)))
@@ -472,14 +668,45 @@ class ClinicApiTests(unittest.TestCase):
             self.assertNotIn("users", tables)
         self.migrate("head")
         with self.database.session_factory.begin() as session:
-            seed_demo_data(session, include_visit=False)
+            seed_demo_data(session, demo_password=DEMO_PASSWORD, include_visit=False)
         self.expect(self.book(), 201)
 
+    def test_auth_migration_preserves_existing_accounts_and_appointments(self):
+        appointment = self.expect(self.book(), 201)
+        legacy_token = "demo-patient"
+        legacy_hash = sha256(legacy_token.encode()).hexdigest()
+        with self.database.session_factory.begin() as session:
+            session.add(AccessToken(token_hash=legacy_hash, user_id=PATIENT_ID))
+        self.migrate("0001_clinic_schema", downgrade=True)
+        self.migrate("head")
+
+        with self.database.session_factory() as session:
+            patient = session.get(User, PATIENT_ID)
+            visit = session.get(Appointment, appointment["id"])
+            self.assertEqual(patient.role, Role.PATIENT)
+            self.assertIsNone(patient.email)
+            self.assertIsNone(patient.password_hash)
+            self.assertEqual(visit.patient_id, patient.id)
+            self.assertIsNotNone(session.get(AccessToken, legacy_hash))
+        self.expect(self.client.get("/appointments", headers=self.auth(PATIENT_ID)), 401)
+        with self.database.session_factory.begin() as session:
+            seed_demo_data(session, demo_password=DEMO_PASSWORD, include_visit=False)
+
+        self.expect(self.client.get("/appointments", headers=self.bearer(legacy_token)), 401)
+        token = self.login("patient@example.com")
+        visits = self.expect(self.client.get("/appointments", headers=self.bearer(token)), 200)
+        self.assertEqual([visit["id"] for visit in visits], [appointment["id"]])
+
     def test_null_character_inputs_are_rejected_without_poisoning_sessions(self):
-        admin = self.auth("demo-admin")
+        admin = self.auth(ADMIN_ID)
         self.expect(self.client.post("/specialties", headers=admin, json={"name": "Bad\u0000Name"}), 422)
         self.expect(self.client.post("/doctors", headers=admin,
-                                     json={"name": "Bad\u0000Name", "specialty_id": 1}), 422)
+                                     json={
+                                         "name": "Bad\u0000Name",
+                                         "specialty_id": 1,
+                                         "email": "invalid-name@example.com",
+                                         "password": DEMO_PASSWORD,
+                                     }), 422)
         self.expect(self.client.get("/doctors", params={"q": "bad\u0000query"}), 422)
         appointment = self.expect(self.book(), 201)
         self.now += timedelta(hours=2)
@@ -489,25 +716,25 @@ class ClinicApiTests(unittest.TestCase):
             {"diagnosis": "Valid observation", "notes": "Bad\u0000Note"},
         ]:
             with self.subTest(payload=payload):
-                self.expect(self.client.post(path, headers=self.auth("demo-doctor"), json=payload), 422)
+                self.expect(self.client.post(path, headers=self.auth(DOCTOR_ID), json=payload), 422)
         self.expect(self.client.get("/doctors"), 200)
-        self.expect(self.client.post(path, headers=self.auth("demo-doctor"),
+        self.expect(self.client.post(path, headers=self.auth(DOCTOR_ID),
                                      json={"diagnosis": "Valid fictional observation"}), 201)
 
     def test_statistics_respect_role_and_date_filters(self):
-        admin = self.auth("demo-admin")
+        admin = self.auth(ADMIN_ID)
         appointment = self.expect(self.book(), 201)
         self.expect(self.book(day=17), 201)
         self.expect(
             self.client.patch(
                 f"/appointments/{appointment['id']}",
-                headers=self.auth("demo-patient"),
+                headers=self.auth(PATIENT_ID),
                 json={"status": "cancelled"},
             ),
             200,
         )
         self.expect(self.client.get("/statistics"), 401)
-        self.expect(self.client.get("/statistics", headers=self.auth("demo-doctor")), 403)
+        self.expect(self.client.get("/statistics", headers=self.auth(DOCTOR_ID)), 403)
         stats = self.expect(
             self.client.get(
                 "/statistics",
@@ -517,7 +744,7 @@ class ClinicApiTests(unittest.TestCase):
             200,
         )
         self.assertEqual(stats["total_appointments"], 1)
-        self.assertEqual(stats["appointments_by_status"], {"booked": 0, "cancelled": 1, "done": 0})
+        self.assertEqual(stats["appointments_by_status"], {"booked": 0, "cancelled": 1, "done": 0, "no_show": 0})
         self.expect(
             self.client.get(
                 "/statistics",
@@ -526,6 +753,174 @@ class ClinicApiTests(unittest.TestCase):
             ),
             422,
         )
+
+    def test_reschedule_offers_released_slot_to_first_waitlisted_patient(self):
+        original = self.expect(self.book(), 201)
+        self.expect(self.book(minute=30), 201)
+        third_user = self.expect(self.client.post("/auth/register", json={
+            "name": "Another Patient", "email": "another@example.com", "password": DEMO_PASSWORD,
+        }), 201)
+        waitlist_request = {"doctor_id": DOCTOR_ID, "date": "2026-11-16"}
+        first = self.expect(self.client.post(
+            "/waitlist", headers=self.auth(SECOND_PATIENT_ID), json=waitlist_request
+        ), 201)
+        self.expect(self.client.post(
+            "/waitlist", headers=self.auth(third_user["id"]), json=waitlist_request
+        ), 201)
+
+        reschedule = f"/appointments/{original['id']}/reschedule"
+        self.expect(self.client.patch(reschedule, headers=self.auth(PATIENT_ID), json={
+            "starts_at": "2026-11-16T09:30:00+05:00",
+        }), 409)
+        unchanged = self.expect(self.client.get("/appointments", headers=self.auth(PATIENT_ID)), 200)
+        self.assertEqual(unchanged[0]["starts_at"], original["starts_at"])
+        self.expect(self.client.patch(reschedule, headers=self.auth(PATIENT_ID), json={
+            "starts_at": "2026-11-17T09:00:00+05:00",
+        }), 200)
+
+        notices = self.expect(self.client.get("/notifications", headers=self.auth(SECOND_PATIENT_ID)), 200)
+        self.assertEqual([(n["kind"], n["subject_id"]) for n in notices], [("waitlist_offer", first["id"])])
+        self.assertEqual(
+            self.expect(self.client.get("/notifications", headers=self.auth(third_user["id"])), 200), []
+        )
+        read = f"/notifications/{notices[0]['id']}/read"
+        self.expect(self.client.patch(read, headers=self.auth(PATIENT_ID)), 404)
+        self.expect(self.client.patch(read, headers=self.auth(SECOND_PATIENT_ID)), 204)
+        accept = f"/waitlist/{first['id']}/accept"
+        self.expect(self.client.post(accept, headers=self.auth(third_user["id"])), 403)
+        booked = self.expect(self.client.post(accept, headers=self.auth(SECOND_PATIENT_ID)), 201)
+        self.assertEqual(booked["starts_at"], original["starts_at"])
+        self.assertNotEqual(booked["id"], original["id"])
+        self.expect(self.client.post(accept, headers=self.auth(SECOND_PATIENT_ID)), 409)
+
+    def test_intake_attendance_and_booked_follow_up_link_previous_record(self):
+        visit = self.expect(self.book(), 201)
+        path = f"/appointments/{visit['id']}"
+        intake = {"reason": "Discuss a sample concern", "questions": "What happens next?"}
+        self.expect(self.client.put(f"{path}/intake", headers=self.auth(PATIENT_ID), json=intake), 200)
+        self.expect(self.client.get(f"{path}/intake", headers=self.auth(SECOND_DOCTOR_ID)), 403)
+        seen = self.expect(self.client.get(f"{path}/intake", headers=self.auth(DOCTOR_ID)), 200)
+        self.assertEqual(seen["questions"], intake["questions"])
+        self.expect(self.client.patch(
+            f"{path}/attendance", headers=self.auth(DOCTOR_ID), json={"status": "arrived"}
+        ), 409)
+
+        self.now = self.now.replace(hour=10)
+        arrived = self.expect(self.client.patch(
+            f"{path}/attendance", headers=self.auth(DOCTOR_ID), json={"status": "arrived"}
+        ), 200)
+        self.assertIsNotNone(arrived["arrived_at"])
+        notes = {"diagnosis": "Fictional note", "notes": "Discuss a follow-up."}
+        self.expect(self.client.post(f"{path}/medical-record", headers=self.auth(DOCTOR_ID), json=notes), 201)
+        recommendation = self.expect(self.client.post(
+            f"{path}/follow-up", headers=self.auth(DOCTOR_ID),
+            json={"start_date": "2026-11-17", "end_date": "2026-11-19"},
+        ), 201)
+        notifications = self.expect(self.client.get("/notifications", headers=self.auth(PATIENT_ID)), 200)
+        self.assertIn(("follow_up", recommendation["id"]), {(n["kind"], n["subject_id"]) for n in notifications})
+        follow_up_path = f"/follow-ups/{recommendation['id']}/book"
+        booking = {"starts_at": "2026-11-18T09:00:00+05:00"}
+        self.expect(self.client.post(follow_up_path, headers=self.auth(SECOND_PATIENT_ID), json=booking), 403)
+        self.expect(self.client.post(follow_up_path, headers=self.auth(PATIENT_ID), json={
+            "starts_at": "2026-11-20T09:00:00+05:00",
+        }), 409)
+        follow_up = self.expect(self.client.post(follow_up_path, headers=self.auth(PATIENT_ID), json=booking), 201)
+        self.assertEqual(follow_up["doctor_id"], DOCTOR_ID)
+        self.assertEqual(follow_up["previous_appointment_id"], visit["id"])
+        previous = self.expect(self.client.get(f"{path}/medical-record", headers=self.auth(DOCTOR_ID)), 200)
+        self.assertEqual(previous["diagnosis"], notes["diagnosis"])
+        self.expect(self.client.get(f"{path}/medical-record", headers=self.auth(SECOND_DOCTOR_ID)), 403)
+        self.expect(self.client.post(follow_up_path, headers=self.auth(PATIENT_ID), json=booking), 409)
+
+    def test_no_show_remains_terminal_and_has_no_consultation(self):
+        visit = self.expect(self.book(), 201)
+        path = f"/appointments/{visit['id']}"
+        self.now = self.now.replace(hour=10)
+        no_show = self.expect(self.client.patch(
+            f"{path}/attendance", headers=self.auth(DOCTOR_ID), json={"status": "no_show"}
+        ), 200)
+        self.assertEqual(no_show["status"], "no_show")
+        self.assertIsNone(no_show["arrived_at"])
+        self.expect(self.client.patch(
+            f"{path}/attendance", headers=self.auth(DOCTOR_ID), json={"status": "arrived"}
+        ), 409)
+        self.expect(self.client.post(
+            f"{path}/medical-record", headers=self.auth(DOCTOR_ID), json={"diagnosis": "Fictional"}
+        ), 409)
+        self.expect(self.client.get(f"{path}/medical-record", headers=self.auth(PATIENT_ID)), 404)
+        self.expect(self.client.post(f"{path}/review", headers=self.auth(PATIENT_ID), json={"rating": 4}), 409)
+        self.expect(self.client.post(f"{path}/certificate", headers=self.auth(PATIENT_ID)), 409)
+        visits = self.expect(self.client.get("/appointments?status=no_show", headers=self.auth(PATIENT_ID)), 200)
+        self.assertEqual([row["id"] for row in visits], [visit["id"]])
+
+    def test_moderated_review_and_staff_approved_certificate(self):
+        visit = self.expect(self.book(), 201)
+        path = f"/appointments/{visit['id']}"
+        self.now = self.now.replace(hour=10)
+        self.expect(self.client.post(
+            f"{path}/medical-record", headers=self.auth(DOCTOR_ID), json={"diagnosis": "Sample note"}
+        ), 201)
+        patient, staff = self.auth(PATIENT_ID), self.auth(ADMIN_ID)
+        review = self.expect(self.client.post(
+            f"{path}/review", headers=patient, json={"rating": 5, "comment": "Clear explanations."}
+        ), 201)
+        public = f"/doctors/{DOCTOR_ID}/reviews"
+        self.assertIsNone(self.expect(self.client.get(public), 200)["average_rating"])
+        self.expect(self.client.post(f"{path}/review", headers=patient, json={"rating": 4}), 409)
+        self.expect(self.client.patch(f"/admin/reviews/{review['id']}/publish", headers=patient), 403)
+        self.expect(self.client.patch(f"/admin/reviews/{review['id']}/publish", headers=staff), 200)
+        summary = self.expect(self.client.get(public), 200)
+        self.assertEqual((summary["review_count"], summary["average_rating"]), (1, 5.0))
+        self.assertEqual(set(summary["reviews"][0]), {"rating", "comment", "published_at"})
+
+        certificate = self.expect(self.client.post(f"{path}/certificate", headers=patient), 201)
+        self.assertEqual(certificate["status"], "pending")
+        self.expect(self.client.get(f"{path}/certificate.pdf", headers=patient), 409)
+        self.expect(self.client.get("/admin/certificates", headers=patient), 403)
+        self.expect(self.client.patch(f"/admin/certificates/{visit['id']}/approve", headers=staff), 200)
+        self.expect(self.client.get(f"{path}/certificate.pdf", headers=self.auth(SECOND_PATIENT_ID)), 403)
+        pdf = self.client.get(f"{path}/certificate.pdf", headers=patient)
+        self.assertEqual(pdf.status_code, 200)
+        self.assertEqual(pdf.headers["Content-Type"], "application/pdf")
+        self.assertTrue(pdf.content.startswith(b"%PDF-"))
+
+    def test_shift_replacement_requires_same_specialty_and_patient_confirmation(self):
+        visit = self.expect(self.book(), 201)
+        admin = self.auth(ADMIN_ID)
+        new_doctor = self.expect(self.client.post("/doctors", headers=admin, json={
+            "name": "Substitute Doctor", "email": "substitute@example.com",
+            "specialty_id": 1, "password": DEMO_PASSWORD,
+        }), 201)
+        self.expect(self.client.put(
+            "/doctors/me/schedule/0", headers=self.auth(new_doctor["id"]),
+            json={"start": "09:00", "end": "17:00", "slot_minutes": 30},
+        ), 200)
+        shift = {"doctor_id": DOCTOR_ID, "date": "2026-11-16"}
+        self.expect(self.client.post("/shift-replacements", headers=admin, json={
+            **shift, "replacement_doctor_id": SECOND_DOCTOR_ID,
+        }), 409)
+        offers = self.expect(self.client.post("/shift-replacements", headers=admin, json={
+            **shift, "replacement_doctor_id": new_doctor["id"],
+        }), 201)
+        self.assertEqual(offers[0]["appointment_id"], visit["id"])
+        self.expect(self.client.delete(
+            "/doctors/me/days-off/2026-11-16", headers=self.auth(DOCTOR_ID)
+        ), 409)
+        intake = f"/appointments/{visit['id']}/intake"
+        self.expect(self.client.put(intake, headers=self.auth(PATIENT_ID), json={
+            "reason": "Sample concern", "questions": "What should I bring?",
+        }), 200)
+        during = self.expect(self.client.get("/appointments", headers=self.auth(PATIENT_ID)), 200)
+        self.assertEqual(during[0]["doctor_id"], DOCTOR_ID)
+        accept = f"/shift-replacements/{offers[0]['id']}/accept"
+        self.expect(self.client.post(accept, headers=self.auth(SECOND_PATIENT_ID)), 403)
+        accepted = self.expect(self.client.post(accept, headers=self.auth(PATIENT_ID)), 200)
+        self.assertEqual(accepted["doctor_id"], new_doctor["id"])
+        self.assertEqual(accepted["starts_at"], visit["starts_at"])
+        self.expect(self.client.get(intake, headers=self.auth(DOCTOR_ID)), 403)
+        self.expect(self.client.get(intake, headers=self.auth(new_doctor["id"])), 200)
+        self.assertEqual(self.expect(self.slots(), 200), [])
+        self.expect(self.client.post(accept, headers=self.auth(PATIENT_ID)), 409)
 
 
 if __name__ == "__main__":

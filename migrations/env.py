@@ -3,7 +3,7 @@ from sqlalchemy import create_engine, pool
 
 from app.config import get_database_url
 from app.database import Base
-from app import models  # Register all mapped tables with Base.metadata.
+from app import models, workflow_models  # Register all mapped tables with Base.metadata.
 
 
 target_metadata = Base.metadata
